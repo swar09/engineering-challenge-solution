@@ -20,6 +20,7 @@ tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 rand = "0.10.3"
+quanta = "0.13.0"
 
 [build-dependencies]
 ergo-sbe = "=0.1.16"

@@ -20,7 +20,10 @@ pub const DEFAULT_BATCH_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone)]
 pub enum WsEvent {
-    Processed(usize),
+    Processed {
+        count: usize,
+        messages: Vec<OrderbookMessage>,
+    },
     Discovery(Vec<DiscoveryEvent>),
     Ping,
     Pong,
@@ -35,7 +38,6 @@ pub struct Ws {
     pub pair_id: usize,
     pub symbols: Vec<String>,
     pub orderbooks: HashMap<String, OrderBook>,
-    pub batch_buffer: Vec<OrderbookMessage>,
     pub delta_rate_sum: u64,
     pub last_message_at: Instant,
 }
@@ -54,13 +56,12 @@ impl Ws {
             pair_id,
             symbols: Vec::new(),
             orderbooks: HashMap::new(),
-            batch_buffer: Vec::with_capacity(DEFAULT_BATCH_CAPACITY),
             delta_rate_sum: 0,
             last_message_at: Instant::now(),
         }
     }
 
-    /// Returns `true` when this socket holds the Primary role, enabling batch buffer writes for disk persistence.
+    /// Returns `true` when this socket holds the Primary role, enabling direct emissions into the global min-heap.
     #[inline]
     pub fn should_write_to_buffer(&self) -> bool {
         self.role == WsRole::Primary
@@ -178,11 +179,11 @@ impl Ws {
             Some(Ok(Message::Text(text))) => {
                 self.last_message_at = Instant::now();
                 match self.handle_raw_frame_events(&text) {
-                    Ok((count, discovery)) => {
+                    Ok((count, messages, discovery)) => {
                         if !discovery.is_empty() {
                             Ok(WsEvent::Discovery(discovery))
                         } else {
-                            Ok(WsEvent::Processed(count))
+                            Ok(WsEvent::Processed { count, messages })
                         }
                     }
                     Err(e) => {

@@ -45,7 +45,7 @@ async fn test_flush_all_batch() {
 
     let mut ws0 = mock_ws(WsStatus::Master, WsRole::Primary).await;
     ws0.symbols = vec!["S1".to_string()];
-    ws0.batch_buffer.push(OrderbookMessage::Snapshot(
+    manager.push_to_global_heap(OrderbookMessage::Snapshot(
         engineering_challenge::util::dtos::challenge_orderbook::SnapshotDomain {
             received_at: ts,
             exchange_timestamp: ts,
@@ -92,6 +92,7 @@ async fn test_failover_promotes_replica_and_emits_snapshot() {
     replica.pair_id = 0;
     replica.symbols = vec!["T1".to_string()];
     let mut ob = engineering_challenge::orderbook::OrderBook::new("T1");
+    ob.initial_dump_applied = true;
     ob.bids.insert(500_000, 100_000_000);
     replica.orderbooks.insert("T1".to_string(), ob);
 
@@ -204,8 +205,8 @@ async fn test_poll_next_message_discovery_and_batch_flush() {
     };
     let book_frame = serde_json::to_string(&MarketEvent::Book(book)).unwrap();
 
-    for _ in 0..(engineering_challenge::websocket::ws::DEFAULT_BATCH_CAPACITY - 1) {
-        worker_ws.batch_buffer.push(OrderbookMessage::Snapshot(
+    for _ in 0..(engineering_challenge::websocket::ws_manager::GLOBAL_HEAP_WATERMARK_CAPACITY - 1) {
+        manager.push_to_global_heap(OrderbookMessage::Snapshot(
             engineering_challenge::util::dtos::challenge_orderbook::SnapshotDomain {
                 received_at: chrono::Utc::now(),
                 exchange_timestamp: chrono::Utc::now(),

@@ -94,11 +94,11 @@ pub fn parse_fixed_point_scale(val_str: &str, scale: i64) -> anyhow::Result<i64>
 pub fn parse_exchange_timestamp(ts_str: &str) -> DateTime<Utc> {
     let s = ts_str.trim();
     if let Ok(ms) = s.parse::<i64>() {
-        DateTime::from_timestamp_millis(ms).unwrap_or_else(Utc::now)
+        DateTime::from_timestamp_millis(ms).unwrap_or_else(crate::util::local_now)
     } else if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         dt.with_timezone(&Utc)
     } else {
-        Utc::now()
+        crate::util::local_now()
     }
 }
 

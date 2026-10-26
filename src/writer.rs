@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
 use crossbeam::channel::Receiver;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,7 +43,7 @@ impl SbeBoundedWriter {
         fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create data directory: {:?}", dir))?;
 
-        let timestamp = Utc::now().timestamp_micros();
+        let timestamp = crate::util::local_now().timestamp_micros();
         let file_path = dir.join(format!("market_orderbook_{timestamp}.sbe"));
         let thread_file_path = file_path.clone();
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
-use chrono::Utc;
 use crossbeam::channel::Sender;
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use tracing::{info, warn};
 
 use crate::orderbook::OrderbookMessage;
@@ -16,6 +16,31 @@ pub const DEFAULT_MAX_SYMBOLS_PER_SOCKET: usize = 50;
 pub const DEFAULT_MAX_DELTA_RATE_PER_SOCKET: u64 = 1500;
 pub const DEFAULT_MAX_ACTIVE_PAIRS: usize = 128;
 pub const DEFAULT_MIN_ACTIVE_PAIRS: usize = 4;
+pub const GLOBAL_HEAP_WATERMARK_CAPACITY: usize = 128;
+
+/// Timestamped message for lock-free global min-heap sorting across all sockets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequencedMessage {
+    pub exchange_ts_micros: i64,
+    pub arrival_counter: u64,
+    pub message: OrderbookMessage,
+}
+
+impl Eq for SequencedMessage {}
+
+impl Ord for SequencedMessage {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.exchange_ts_micros
+            .cmp(&other.exchange_ts_micros)
+            .then_with(|| self.arrival_counter.cmp(&other.arrival_counter))
+    }
+}
+
+impl PartialOrd for SequencedMessage {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 pub struct WsManager {
     pub pool: Vec<Ws>,
@@ -27,6 +52,8 @@ pub struct WsManager {
     pub max_symbols_per_socket: usize,
     pub max_delta_rate_per_socket: u64,
     pub max_active_pairs: usize,
+    pub global_heap: BinaryHeap<Reverse<SequencedMessage>>,
+    pub global_seq_counter: u64,
 }
 
 impl WsManager {
@@ -58,7 +85,40 @@ impl WsManager {
             max_symbols_per_socket: max_symbols,
             max_delta_rate_per_socket: max_delta_rate,
             max_active_pairs: max_pairs,
+            global_heap: BinaryHeap::new(),
+            global_seq_counter: 0,
         }
+    }
+
+    /// Pushes an `OrderbookMessage` into the global min-heap sorted by exchange timestamp.
+    pub fn push_to_global_heap(&mut self, msg: OrderbookMessage) {
+        self.global_seq_counter = self.global_seq_counter.saturating_add(1);
+        let ts_micros = msg.exchange_timestamp().timestamp_micros();
+        self.global_heap.push(Reverse(SequencedMessage {
+            exchange_ts_micros: ts_micros,
+            arrival_counter: self.global_seq_counter,
+            message: msg,
+        }));
+    }
+
+    /// Drains up to `count` items from the global min-heap in strictly sorted order.
+    pub fn drain_global_heap_batch(&mut self, count: usize) -> Vec<OrderbookMessage> {
+        let mut batch = Vec::with_capacity(count);
+        while batch.len() < count
+            && let Some(Reverse(seq_msg)) = self.global_heap.pop()
+        {
+            batch.push(seq_msg.message);
+        }
+        batch
+    }
+
+    /// Drains all messages currently buffered in the global min-heap in strictly sorted order.
+    pub fn drain_all_global_heap(&mut self) -> Vec<OrderbookMessage> {
+        let mut all = Vec::with_capacity(self.global_heap.len());
+        while let Some(Reverse(seq_msg)) = self.global_heap.pop() {
+            all.push(seq_msg.message);
+        }
+        all
     }
 
     /// Returns the sum of all deltas processed across all sockets in the pool.
@@ -146,31 +206,37 @@ impl WsManager {
             .position(|ws| ws.pair_id == pair_id && ws.role == WsRole::Replica)
     }
 
-    /// Takes the full `batch_buffer` from every socket in the pool via `std::mem::take` and sends each non-empty batch to the writer channel.
+    /// Drains all messages currently buffered in the global min-heap in strictly sorted order
+    /// and dispatches them to the writer channel.
     pub fn flush_all(&mut self) {
-        for ws in &mut self.pool {
-            if !ws.batch_buffer.is_empty() {
-                let batch = std::mem::take(&mut ws.batch_buffer);
-                let _ = self.writer_tx.send(batch);
-            }
+        let sorted = self.drain_all_global_heap();
+        if !sorted.is_empty() {
+            let _ = self.writer_tx.send(sorted);
         }
     }
 
-    /// Iterates all active Primary sockets, converts each resting orderbook into a `SnapshotDomain`, and dispatches the collected batch to the writer channel.
+    /// Iterates all active Primary sockets, converts each resting orderbook into a `SnapshotDomain`,
+    /// pushes snapshots into the global min-heap, and flushes to writer channel.
     pub fn snapshot_resting_books(&mut self) {
-        let now = Utc::now();
-        let mut batch = Vec::new();
+        let now = crate::util::local_now();
+        let mut snaps = Vec::new();
         for ws in &mut self.pool {
             if ws.should_write_to_buffer() {
                 for book in ws.orderbooks.values() {
-                    let ex_ts = book.last_exchange_timestamp.unwrap_or(now);
-                    let snap = book.to_snapshot_domain(now, ex_ts);
-                    batch.push(OrderbookMessage::Snapshot(snap));
+                    if book.initial_dump_applied {
+                        let ex_ts = book.last_exchange_timestamp.unwrap_or(now);
+                        let snap = book.to_snapshot_domain(now, ex_ts);
+                        snaps.push(OrderbookMessage::Snapshot(snap));
+                    }
                 }
             }
         }
-        if !batch.is_empty() {
-            let _ = self.writer_tx.send(batch);
+        for s in snaps {
+            self.push_to_global_heap(s);
+        }
+        let sorted = self.drain_all_global_heap();
+        if !sorted.is_empty() {
+            let _ = self.writer_tx.send(sorted);
         }
     }
 
@@ -185,11 +251,16 @@ impl WsManager {
             }
         }
         for ws in &mut self.standby_pool {
-            let _ = ws.send_ping().await;
+            if ws.status == WsStatus::Healthy
+                && let Err(e) = ws.send_ping().await
+            {
+                warn!("Failed to send PING to standby socket: {e}");
+                ws.status = WsStatus::Unhealthy;
+            }
         }
     }
 
-    /// Connects fresh pre-warmed sockets in the background until `standby_pool` reaches at least `MIN_STANDBY_CAPACITY` (10) entries.
+    /// Ensures the standby pool maintains at least `MIN_STANDBY_CAPACITY` pre-warmed sockets.
     pub async fn maintain_standby_pool(&mut self, ws_url: &str) -> Result<()> {
         let current_len = self.standby_pool.len();
         if current_len < MIN_STANDBY_CAPACITY {
@@ -209,11 +280,11 @@ impl WsManager {
         Ok(())
     }
 
-    /// PINGs all standby sockets, retains those that respond successfully, discards unresponsive ones, and replenishes the pool to `MIN_STANDBY_CAPACITY`.
+    /// Pings all standby sockets, filters out disconnected or unhealthy sockets, and replenishes the standby pool.
     pub async fn prune_and_ping_standby(&mut self, ws_url: &str) {
         let mut healthy_standbys = VecDeque::new();
         while let Some(mut ws) = self.standby_pool.pop_front() {
-            if ws.send_ping().await.is_ok() {
+            if ws.status == WsStatus::Healthy && ws.send_ping().await.is_ok() {
                 healthy_standbys.push_back(ws);
             }
         }
@@ -234,20 +305,19 @@ impl WsManager {
             }
         }
 
-        // Monitor pairs for divergence
-        for (p_idx, r_idx) in pairs {
-            let primary = &self.pool[p_idx];
-            let replica = &self.pool[r_idx];
-            self.subscription_manager.monitor_pairs(primary, replica);
+        for (pri_idx, rep_idx) in pairs {
+            let pri_ws = &self.pool[pri_idx];
+            let rep_ws = &self.pool[rep_idx];
+            self.subscription_manager.monitor_pairs(pri_ws, rep_ws);
         }
 
-        // Process queued resubscriptions through token bucket
         self.subscription_manager
             .process_queue(&mut self.pool)
             .await;
     }
 
-    /// Races all active pool sockets concurrently for the next incoming frame, dispatches the winning event (including discovery routing and batch-full flush), and triggers the hot-swap failover protocol on any read error.
+    /// Races all active pool sockets concurrently for the next incoming frame, dispatches the winning event,
+    /// feeds Primary messages into the global min-heap, and flushes strictly sorted batches to writer channel.
     pub async fn poll_next_message(&mut self, ws_url: &str) -> Result<()> {
         let mut futures = Vec::new();
         for (socket_idx, ws) in self.pool.iter_mut().enumerate() {
@@ -268,108 +338,123 @@ impl WsManager {
 
         match result {
             Ok(event) => {
-                if let WsEvent::Discovery(discovery_events) = event {
-                    for ev in discovery_events {
-                        match ev {
-                            DiscoveryEvent::NewMarket(m) => {
-                                info!("NewMarket discovered: {} tokens", m.assets_ids.len());
-                                for token in &m.assets_ids {
-                                    if !self.symbol_states.contains_key(token) {
-                                        // 1. Try finding an existing socket below 80% threshold
-                                        // 2. If all sockets are saturated, dynamically claim a new pair from standby
-                                        // 3. Fallback to least loaded socket if hard cap reached
-                                        let target_primary_idx = match self
-                                            .find_available_candidate_socket_index()
-                                        {
-                                            Some(idx) => Some(idx),
-                                            None => {
-                                                info!(
-                                                    "All active sockets saturated; dynamic expansion for token {token}..."
-                                                );
-                                                self.expand_pool_from_standby(ws_url).await.or_else(
-                                                    || self.find_least_loaded_socket_index(),
-                                                )
-                                            }
-                                        };
-
-                                        if let Some(primary_idx) = target_primary_idx {
-                                            let pair_id = self.pool[primary_idx].pair_id;
-                                            info!(
-                                                "Assigning token {token} to pair #{pair_id} (Primary #{primary_idx})"
-                                            );
-
-                                            if let Some(replica_idx) =
-                                                self.find_paired_replica_index(pair_id)
+                match event {
+                    WsEvent::Discovery(discovery_events) => {
+                        for ev in discovery_events {
+                            match ev {
+                                DiscoveryEvent::NewMarket(m) => {
+                                    info!("NewMarket discovered: {} tokens", m.assets_ids.len());
+                                    for token in &m.assets_ids {
+                                        if !self.symbol_states.contains_key(token) {
+                                            // 1. Try finding an existing socket below 80% threshold
+                                            // 2. If all sockets are saturated, dynamically claim a new pair from standby
+                                            // 3. Fallback to least loaded socket if hard cap reached
+                                            let target_primary_idx = match self
+                                                .find_available_candidate_socket_index()
                                             {
-                                                let replica_ws = &mut self.pool[replica_idx];
-                                                if let Err(e) = replica_ws
+                                                Some(idx) => Some(idx),
+                                                None => {
+                                                    info!(
+                                                        "All active sockets saturated; dynamic expansion for token {token}..."
+                                                    );
+                                                    self.expand_pool_from_standby(ws_url)
+                                                        .await
+                                                        .or_else(|| {
+                                                            self.find_least_loaded_socket_index()
+                                                        })
+                                                }
+                                            };
+
+                                            if let Some(primary_idx) = target_primary_idx {
+                                                let pair_id = self.pool[primary_idx].pair_id;
+                                                info!(
+                                                    "Assigning token {token} to pair #{pair_id} (Primary #{primary_idx})"
+                                                );
+
+                                                if let Some(replica_idx) =
+                                                    self.find_paired_replica_index(pair_id)
+                                                {
+                                                    let replica_ws = &mut self.pool[replica_idx];
+                                                    if let Err(e) = replica_ws
+                                                        .subscribe_dynamic(std::slice::from_ref(
+                                                            token,
+                                                        ))
+                                                        .await
+                                                    {
+                                                        warn!(
+                                                            "Failed subscribing Replica #{replica_idx}: {e}"
+                                                        );
+                                                    }
+                                                }
+
+                                                let primary_ws = &mut self.pool[primary_idx];
+                                                if let Err(e) = primary_ws
                                                     .subscribe_dynamic(std::slice::from_ref(token))
                                                     .await
                                                 {
                                                     warn!(
-                                                        "Failed subscribing Replica #{replica_idx}: {e}"
+                                                        "Failed subscribing Primary #{primary_idx}: {e}"
                                                     );
                                                 }
-                                            }
 
-                                            let primary_ws = &mut self.pool[primary_idx];
-                                            if let Err(e) = primary_ws
-                                                .subscribe_dynamic(std::slice::from_ref(token))
-                                                .await
-                                            {
-                                                warn!(
-                                                    "Failed subscribing Primary #{primary_idx}: {e}"
+                                                self.symbol_states.insert(
+                                                    token.clone(),
+                                                    SymbolState::new(token.clone(), primary_idx),
                                                 );
                                             }
-
-                                            self.symbol_states.insert(
-                                                token.clone(),
-                                                SymbolState::new(token.clone(), primary_idx),
-                                            );
                                         }
                                     }
                                 }
-                            }
-                            DiscoveryEvent::MarketResolved(r) => {
-                                info!(
-                                    "MarketResolved: market={}, retiring {} tokens",
-                                    r.market,
-                                    r.assets_ids.len()
-                                );
-                                for token in &r.assets_ids {
-                                    if let Some(state) = self.symbol_states.remove(token) {
-                                        let primary_idx = state.socket_index;
-                                        if primary_idx < self.pool.len() {
-                                            let pair_id = self.pool[primary_idx].pair_id;
+                                DiscoveryEvent::MarketResolved(r) => {
+                                    info!(
+                                        "MarketResolved: market={}, retiring {} tokens",
+                                        r.market,
+                                        r.assets_ids.len()
+                                    );
+                                    for token in &r.assets_ids {
+                                        if let Some(state) = self.symbol_states.remove(token) {
+                                            let primary_idx = state.socket_index;
+                                            if primary_idx < self.pool.len() {
+                                                let pair_id = self.pool[primary_idx].pair_id;
 
-                                            if let Some(replica_idx) =
-                                                self.find_paired_replica_index(pair_id)
-                                            {
-                                                let replica_ws = &mut self.pool[replica_idx];
-                                                let _ = replica_ws
+                                                if let Some(replica_idx) =
+                                                    self.find_paired_replica_index(pair_id)
+                                                {
+                                                    let replica_ws = &mut self.pool[replica_idx];
+                                                    let _ = replica_ws
+                                                        .unsubscribe(std::slice::from_ref(token))
+                                                        .await;
+                                                }
+
+                                                let primary_ws = &mut self.pool[primary_idx];
+                                                let _ = primary_ws
                                                     .unsubscribe(std::slice::from_ref(token))
                                                     .await;
                                             }
-
-                                            let primary_ws = &mut self.pool[primary_idx];
-                                            let _ = primary_ws
-                                                .unsubscribe(std::slice::from_ref(token))
-                                                .await;
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                    WsEvent::Processed { count: _, messages } => {
+                        let ws = &self.pool[socket_idx];
+                        if ws.should_write_to_buffer() {
+                            for msg in messages {
+                                self.push_to_global_heap(msg);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
 
-                // If Primary batch buffer reached threshold, flush this socket to writer channel
-                let ws = &mut self.pool[socket_idx];
-                if ws.should_write_to_buffer()
-                    && ws.batch_buffer.len() >= crate::websocket::ws::DEFAULT_BATCH_CAPACITY
-                {
-                    let batch = std::mem::take(&mut ws.batch_buffer);
-                    let _ = self.writer_tx.send(batch);
+                // If global heap reached watermark capacity, flush 64-message sorted batch to writer channel
+                if self.global_heap.len() >= GLOBAL_HEAP_WATERMARK_CAPACITY {
+                    let batch =
+                        self.drain_global_heap_batch(crate::websocket::ws::DEFAULT_BATCH_CAPACITY);
+                    if !batch.is_empty() {
+                        let _ = self.writer_tx.send(batch);
+                    }
                 }
             }
             Err(e) => {
@@ -382,21 +467,14 @@ impl WsManager {
         Ok(())
     }
 
-    /// Executes hot-swap failover protocol for a disconnected socket
-    /// drains its batch buffer to the writer channel, evaluates paired
-    ///  replica health to choose Branch A (direct promotion) or Branch B (cold standby),
+    /// Executes hot-swap failover protocol for a disconnected socket:
+    /// evaluates paired replica health to choose Branch A (direct promotion) or Branch B (cold standby),
     /// and replenishes the standby pool to the minimum capacity.
     pub async fn handle_socket_disconnect(&mut self, dead_idx: usize, ws_url: &str) {
         let dead_role = self.pool[dead_idx].role;
         let dead_pair_id = self.pool[dead_idx].pair_id;
         let is_master = dead_idx == self.master_index;
         let symbols = std::mem::take(&mut self.pool[dead_idx].symbols);
-
-        // Drain dying socket's buffer to disk
-        if !self.pool[dead_idx].batch_buffer.is_empty() {
-            let batch = std::mem::take(&mut self.pool[dead_idx].batch_buffer);
-            let _ = self.writer_tx.send(batch);
-        }
 
         if dead_role == WsRole::Primary {
             info!("Ws died: Primary #{dead_idx} (pair #{dead_pair_id}). Evaluating failover...");
@@ -410,30 +488,39 @@ impl WsManager {
 
             if replica_is_healthy {
                 let replica_idx = replica_opt.unwrap();
-                let replica = &mut self.pool[replica_idx];
-                replica.role = WsRole::Primary;
-                if is_master {
-                    replica.status = WsStatus::Master;
-                    self.master_index = replica_idx;
-                }
-                info!(
-                    "Hot swap Branch A: promoted Replica #{replica_idx} to Primary (pair #{dead_pair_id})"
-                );
-
-                // Emit snapshot of resting orderbooks from promoted socket to establish fresh baseline
-                let now = Utc::now();
+                let now = crate::util::local_now();
                 let mut snaps = Vec::new();
-                for book in replica.orderbooks.values() {
-                    let ex_ts = book.last_exchange_timestamp.unwrap_or(now);
-                    snaps.push(OrderbookMessage::Snapshot(
-                        book.to_snapshot_domain(now, ex_ts),
-                    ));
-                }
-                if !snaps.is_empty() {
-                    let _ = self.writer_tx.send(snaps);
+                let rep_symbols = self.pool[replica_idx].symbols.clone();
+
+                {
+                    let replica = &mut self.pool[replica_idx];
+                    replica.role = WsRole::Primary;
+                    if is_master {
+                        replica.status = WsStatus::Master;
+                        self.master_index = replica_idx;
+                    }
+                    info!(
+                        "Hot swap Branch A: promoted Replica #{replica_idx} to Primary (pair #{dead_pair_id})"
+                    );
+
+                    for book in replica.orderbooks.values() {
+                        if book.initial_dump_applied {
+                            let ex_ts = book.last_exchange_timestamp.unwrap_or(now);
+                            let snap = book.to_snapshot_domain(now, ex_ts);
+                            snaps.push(OrderbookMessage::Snapshot(snap));
+                        }
+                    }
                 }
 
-                for s in &replica.symbols {
+                for s in snaps {
+                    self.push_to_global_heap(s);
+                }
+                let sorted = self.drain_all_global_heap();
+                if !sorted.is_empty() {
+                    let _ = self.writer_tx.send(sorted);
+                }
+
+                for s in &rep_symbols {
                     if let Some(state) = self.symbol_states.get_mut(s) {
                         state.socket_index = replica_idx;
                     }
