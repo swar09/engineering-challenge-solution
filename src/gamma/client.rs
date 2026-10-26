@@ -24,6 +24,7 @@ impl GammaClient {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
+                .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
                 .build()
                 .unwrap_or_default(),
             base_url: base_url.into(),

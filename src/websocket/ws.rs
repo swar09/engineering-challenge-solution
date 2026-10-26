@@ -132,6 +132,7 @@ impl Ws {
 
     /// Registers new symbols on this live socket, initialises their in-memory orderbook entries, and dispatches a dynamic subscribe frame to the exchange.
     pub async fn subscribe_dynamic(&mut self, symbols: &[String]) -> Result<()> {
+        let is_empty_start = self.symbols.is_empty();
         for s in symbols {
             if !self.symbols.contains(s) {
                 self.symbols.push(s.clone());
@@ -141,8 +142,25 @@ impl Ws {
                 .or_insert_with(|| OrderBook::new(s.clone()));
         }
 
-        self.update_subscription(Operation::Subscribe, symbols)
-            .await
+        if is_empty_start {
+            // First time this socket subscribes: use initial SubscriptionRequest framing
+            let request = if self.status == WsStatus::Master {
+                SubscriptionRequest::with_discovery(symbols.to_vec())
+            } else {
+                SubscriptionRequest::new(symbols.to_vec())
+            };
+            let sub_payload = serde_json::to_string(&request)
+                .context("Failed to serialize initial SubscriptionRequest")?;
+            self.socket
+                .send(Message::Text(sub_payload.into()))
+                .await
+                .context("Failed to send initial subscription frame")?;
+            Ok(())
+        } else {
+            // Socket is already active: use incremental update frame
+            self.update_subscription(Operation::Subscribe, symbols)
+                .await
+        }
     }
 
     /// Removes symbols from the local tracking list, tears down their in-memory orderbook entries, and dispatches an unsubscribe frame to the exchange.

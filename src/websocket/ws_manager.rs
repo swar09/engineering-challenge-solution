@@ -171,8 +171,8 @@ impl WsManager {
             let _ = self.maintain_standby_pool(ws_url).await;
         }
 
-        let mut primary = self.standby_pool.pop_front()?;
-        let mut replica = self.standby_pool.pop_front()?;
+        let mut primary = self.pop_healthy_standby(ws_url).await?;
+        let mut replica = self.pop_healthy_standby(ws_url).await?;
 
         let new_pair_id = self
             .pool
@@ -204,6 +204,19 @@ impl WsManager {
         self.pool
             .iter()
             .position(|ws| ws.pair_id == pair_id && ws.role == WsRole::Replica)
+    }
+
+    /// Pops a verified-healthy standby socket from `standby_pool`, reconnecting if the socket was dropped by the exchange.
+    pub async fn pop_healthy_standby(&mut self, ws_url: &str) -> Option<Ws> {
+        while let Some(ws) = self.standby_pool.pop_front() {
+            if ws.status == WsStatus::Healthy {
+                return Some(ws);
+            }
+        }
+        // If all pre-warmed standbys were stale or pool empty, connect a fresh one
+        Ws::connect(ws_url, WsStatus::Healthy, WsRole::Replica, usize::MAX)
+            .await
+            .ok()
     }
 
     /// Drains all messages currently buffered in the global min-heap in strictly sorted order
@@ -240,21 +253,13 @@ impl WsManager {
         }
     }
 
-    /// Sends a PING frame to every active pool socket and every standby socket, marking any socket that fails as `WsStatus::Unhealthy`.
+    /// Sends a PING frame to every active pool socket, marking any socket that fails as `WsStatus::Unhealthy`.
     pub async fn send_pings(&mut self) {
         for ws in &mut self.pool {
             if (ws.status == WsStatus::Master || ws.status == WsStatus::Healthy)
                 && let Err(e) = ws.send_ping().await
             {
                 warn!("Failed to send PING to socket: {e}");
-                ws.status = WsStatus::Unhealthy;
-            }
-        }
-        for ws in &mut self.standby_pool {
-            if ws.status == WsStatus::Healthy
-                && let Err(e) = ws.send_ping().await
-            {
-                warn!("Failed to send PING to standby socket: {e}");
                 ws.status = WsStatus::Unhealthy;
             }
         }
@@ -280,11 +285,11 @@ impl WsManager {
         Ok(())
     }
 
-    /// Pings all standby sockets, filters out disconnected or unhealthy sockets, and replenishes the standby pool.
+    /// Cleans and replenishes the standby pool.
     pub async fn prune_and_ping_standby(&mut self, ws_url: &str) {
         let mut healthy_standbys = VecDeque::new();
-        while let Some(mut ws) = self.standby_pool.pop_front() {
-            if ws.status == WsStatus::Healthy && ws.send_ping().await.is_ok() {
+        while let Some(ws) = self.standby_pool.pop_front() {
+            if ws.status == WsStatus::Healthy {
                 healthy_standbys.push_back(ws);
             }
         }
@@ -344,62 +349,62 @@ impl WsManager {
                             match ev {
                                 DiscoveryEvent::NewMarket(m) => {
                                     info!("NewMarket discovered: {} tokens", m.assets_ids.len());
-                                    for token in &m.assets_ids {
-                                        if !self.symbol_states.contains_key(token) {
-                                            // 1. Try finding an existing socket below 80% threshold
-                                            // 2. If all sockets are saturated, dynamically claim a new pair from standby
-                                            // 3. Fallback to least loaded socket if hard cap reached
-                                            let target_primary_idx = match self
-                                                .find_available_candidate_socket_index()
-                                            {
-                                                Some(idx) => Some(idx),
-                                                None => {
-                                                    info!(
-                                                        "All active sockets saturated; dynamic expansion for token {token}..."
-                                                    );
-                                                    self.expand_pool_from_standby(ws_url)
-                                                        .await
-                                                        .or_else(|| {
-                                                            self.find_least_loaded_socket_index()
-                                                        })
-                                                }
-                                            };
+                                    // Group undiscovered tokens to subscribe them in batches rather than 1-by-1
+                                    let new_tokens: Vec<String> = m
+                                        .assets_ids
+                                        .into_iter()
+                                        .filter(|t| !self.symbol_states.contains_key(t))
+                                        .collect();
 
-                                            if let Some(primary_idx) = target_primary_idx {
-                                                let pair_id = self.pool[primary_idx].pair_id;
+                                    if !new_tokens.is_empty() {
+                                        let target_primary_idx = match self
+                                            .find_available_candidate_socket_index()
+                                        {
+                                            Some(idx) => Some(idx),
+                                            None => {
                                                 info!(
-                                                    "Assigning token {token} to pair #{pair_id} (Primary #{primary_idx})"
+                                                    "All active sockets saturated; dynamic expansion for {} tokens...",
+                                                    new_tokens.len()
                                                 );
+                                                self.expand_pool_from_standby(ws_url).await.or_else(
+                                                    || self.find_least_loaded_socket_index(),
+                                                )
+                                            }
+                                        };
 
-                                                if let Some(replica_idx) =
-                                                    self.find_paired_replica_index(pair_id)
-                                                {
-                                                    let replica_ws = &mut self.pool[replica_idx];
-                                                    if let Err(e) = replica_ws
-                                                        .subscribe_dynamic(std::slice::from_ref(
-                                                            token,
-                                                        ))
-                                                        .await
-                                                    {
-                                                        warn!(
-                                                            "Failed subscribing Replica #{replica_idx}: {e}"
-                                                        );
-                                                    }
-                                                }
+                                        if let Some(primary_idx) = target_primary_idx {
+                                            let pair_id = self.pool[primary_idx].pair_id;
+                                            info!(
+                                                "Assigning {} tokens to pair #{pair_id} (Primary #{primary_idx})",
+                                                new_tokens.len()
+                                            );
 
-                                                let primary_ws = &mut self.pool[primary_idx];
-                                                if let Err(e) = primary_ws
-                                                    .subscribe_dynamic(std::slice::from_ref(token))
-                                                    .await
+                                            if let Some(replica_idx) =
+                                                self.find_paired_replica_index(pair_id)
+                                            {
+                                                let replica_ws = &mut self.pool[replica_idx];
+                                                if let Err(e) =
+                                                    replica_ws.subscribe_dynamic(&new_tokens).await
                                                 {
                                                     warn!(
-                                                        "Failed subscribing Primary #{primary_idx}: {e}"
+                                                        "Failed subscribing Replica #{replica_idx}: {e}"
                                                     );
                                                 }
+                                            }
 
+                                            let primary_ws = &mut self.pool[primary_idx];
+                                            if let Err(e) =
+                                                primary_ws.subscribe_dynamic(&new_tokens).await
+                                            {
+                                                warn!(
+                                                    "Failed subscribing Primary #{primary_idx}: {e}"
+                                                );
+                                            }
+
+                                            for token in new_tokens {
                                                 self.symbol_states.insert(
                                                     token.clone(),
-                                                    SymbolState::new(token.clone(), primary_idx),
+                                                    SymbolState::new(token, primary_idx),
                                                 );
                                             }
                                         }
@@ -527,7 +532,7 @@ impl WsManager {
                 }
 
                 // Restore replica from standby pool
-                if let Some(mut standby_ws) = self.standby_pool.pop_front() {
+                if let Some(mut standby_ws) = self.pop_healthy_standby(ws_url).await {
                     info!("Hot swap: deploying standby as Replica (pair #{dead_pair_id})");
                     standby_ws.status = WsStatus::Healthy;
                     standby_ws.role = WsRole::Replica;
@@ -548,7 +553,7 @@ impl WsManager {
                 warn!(
                     "Hot swap Branch B: replica dead; deploying cold standby as Primary (pair #{dead_pair_id})"
                 );
-                if let Some(mut new_primary) = self.standby_pool.pop_front() {
+                if let Some(mut new_primary) = self.pop_healthy_standby(ws_url).await {
                     new_primary.role = WsRole::Primary;
                     new_primary.pair_id = dead_pair_id;
                     if is_master {
@@ -577,7 +582,7 @@ impl WsManager {
 
                 // Deploy second standby to replace the dead replica
                 if let Some(replica_idx) = replica_opt
-                    && let Some(mut new_replica) = self.standby_pool.pop_front()
+                    && let Some(mut new_replica) = self.pop_healthy_standby(ws_url).await
                 {
                     new_replica.role = WsRole::Replica;
                     new_replica.pair_id = dead_pair_id;
@@ -595,7 +600,7 @@ impl WsManager {
             info!(
                 "Ws died: Replica #{dead_idx} (pair #{dead_pair_id}). Hot swapping from standby..."
             );
-            if let Some(mut standby_ws) = self.standby_pool.pop_front() {
+            if let Some(mut standby_ws) = self.pop_healthy_standby(ws_url).await {
                 standby_ws.status = WsStatus::Healthy;
                 standby_ws.role = WsRole::Replica;
                 standby_ws.pair_id = dead_pair_id;

@@ -1,3 +1,4 @@
+pub mod exchange;
 pub mod gamma;
 pub mod orderbook;
 pub mod polymarket;
