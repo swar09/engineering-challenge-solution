@@ -3,14 +3,14 @@
 use super::types::{ChannelType, Operation, Side};
 use serde::{Deserialize, Serialize};
 
-/// Aggregated price level in a full orderbook snapshot.
+/// Aggregated price level entry (price + size as strings) within a full orderbook snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderSummary {
     pub price: String,
     pub size: String,
 }
 
-/// Metadata for grouped markets under a common parent event.
+/// Descriptive metadata fields for the parent event grouping a set of related prediction markets.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventMessage {
     pub id: Option<String>,
@@ -20,7 +20,7 @@ pub struct EventMessage {
     pub description: Option<String>,
 }
 
-/// Initial subscription request sent immediately after opening a WebSocket connection.
+/// Serialisable frame sent to the exchange immediately after opening a WebSocket connection to establish market channel subscriptions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionRequest {
     pub assets_ids: Vec<String>,
@@ -35,7 +35,7 @@ pub struct SubscriptionRequest {
 }
 
 impl SubscriptionRequest {
-    /// Creates a subscription frame requesting the initial orderbook snapshot.
+    /// Builds a subscription frame with `initial_dump: true` and `level: 2`, requesting the full L2 orderbook snapshot from the exchange on connection.
     pub fn new(assets_ids: Vec<String>) -> Self {
         Self {
             assets_ids,
@@ -46,7 +46,7 @@ impl SubscriptionRequest {
         }
     }
 
-    /// Creates a discovery subscription frame with `custom_feature_enabled = true`.
+    /// Builds a subscription frame with `custom_feature_enabled: true`, activating the discovery feed that emits `new_market` and `market_resolved` events on the anchor socket.
     pub fn with_discovery(assets_ids: Vec<String>) -> Self {
         Self {
             assets_ids,
@@ -58,14 +58,14 @@ impl SubscriptionRequest {
     }
 }
 
-/// Dynamic subscription mutation without restarting the WebSocket connection.
+/// Frame for adding or removing symbols on an open WebSocket connection without tearing down the connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionUpdate {
     pub operation: Operation,
     pub assets_ids: Vec<String>,
 }
 
-/// Full orderbook snapshot (`event_type = "book"`).
+/// Full L2 orderbook snapshot frame received when `event_type = "book"`, containing all resting bid and ask levels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Book {
     pub asset_id: String,
@@ -76,7 +76,7 @@ pub struct Book {
     pub asks: Vec<OrderSummary>,
 }
 
-/// Single price level change inside an incremental update.
+/// One price level mutation within an incremental update batch, carrying asset ID, price, size, and side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceChangeEntry {
     pub asset_id: String,
@@ -88,7 +88,7 @@ pub struct PriceChangeEntry {
     pub best_ask: Option<String>,
 }
 
-/// Incremental price level update frame (`event_type = "price_change"`).
+/// Batch of incremental price level mutations received when `event_type = "price_change"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceChange {
     pub market: String,
@@ -96,7 +96,7 @@ pub struct PriceChange {
     pub price_changes: Vec<PriceChangeEntry>,
 }
 
-/// Trade execution notification (`event_type = "last_trade_price"`).
+/// Executed trade notification received when `event_type = "last_trade_price"`, carrying the matched price, size, and direction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastTradePrice {
     pub asset_id: String,
@@ -109,7 +109,7 @@ pub struct LastTradePrice {
     pub transaction_hash: Option<String>,
 }
 
-/// Market tick size update event (`event_type = "tick_size_change"`).
+/// Tick size update notification received when `event_type = "tick_size_change"`, carrying the old and new minimum price increment for an asset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TickSizeChange {
     pub asset_id: String,
@@ -119,7 +119,7 @@ pub struct TickSizeChange {
     pub timestamp: String,
 }
 
-/// Top of book best bid/ask and spread (`event_type = "best_bid_ask"`).
+/// Best bid and ask quote received when `event_type = "best_bid_ask"`, reflecting the current top-of-book spread.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BestBidAsk {
     pub asset_id: String,
@@ -130,8 +130,8 @@ pub struct BestBidAsk {
     pub timestamp: String,
 }
 
-/// Live new market creation event (`event_type = "new_market"`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// New prediction market creation event received when `event_type = "new_market"`, carrying full market metadata and associated CLOB token IDs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NewMarket {
     #[serde(default)]
     pub id: String,
@@ -171,8 +171,8 @@ pub struct NewMarket {
     pub group_item_title: Option<String>,
 }
 
-/// Market resolution event (`event_type = "market_resolved"`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Market resolution event received when `event_type = "market_resolved"`, identifying the winning asset and outcome.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MarketResolved {
     #[serde(default)]
     pub id: String,

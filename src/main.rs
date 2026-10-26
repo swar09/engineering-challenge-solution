@@ -4,18 +4,20 @@ use tracing::{info, warn};
 use engineering_challenge::gamma::GammaClient;
 use engineering_challenge::symbol::SymbolState;
 use engineering_challenge::websocket::status::WsStatus;
+use engineering_challenge::websocket::subscription_manager::SubscriptionManager;
+use engineering_challenge::websocket::types::WsRole;
 use engineering_challenge::websocket::ws::Ws;
-use engineering_challenge::websocket::ws_manager::WsManager;
-use engineering_challenge::writer::{SbeBoundedWriter, BOUNDED_CHANNEL_CAPACITY};
+use engineering_challenge::websocket::ws_manager::{
+    DEFAULT_MAX_ACTIVE_PAIRS, DEFAULT_MAX_SYMBOLS_PER_SOCKET, DEFAULT_MIN_ACTIVE_PAIRS,
+    MIN_STANDBY_CAPACITY, WsManager,
+};
+use engineering_challenge::writer::{BOUNDED_CHANNEL_CAPACITY, SbeBoundedWriter};
+use rand::seq::SliceRandom;
 
-const NUM_ACTIVE_SOCKETS: usize = 5;
-const NUM_STANDBY_SOCKETS: usize = 2;
+const DEFAULT_POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-
-    // 1. Initialize structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -23,141 +25,223 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!("Starting Polymarket Clean Ingestion Engine...");
+    info!("Starting Polymarket Ingestion Engine");
 
     let polymarket_ws_url = std::env::var("POLYMARKET_WS_URL")
-        .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string());
+        .unwrap_or_else(|_| DEFAULT_POLYMARKET_WS_URL.to_string());
 
-    // 2. Query GammaClient for top 50 symbols
     let gamma_client = GammaClient::new();
-    info!("Querying Gamma API for top active markets...");
-    let symbols = match gamma_client.fetch_top_50_clob_tokens().await {
-        Ok(tokens) => {
-            info!("Fetched {} tokens from Gamma API", tokens.len());
-            tokens
-        }
-        Err(e) => {
-            warn!("Failed to fetch tokens from Gamma API ({e}), using default fallback tokens");
-            vec![
-                "32338220190071351435772801779725302244575775216413325951443816017994629993401"
-                    .to_string(),
-                "25659310674993675562345759665114759892400026242514633218387667107987341231962"
-                    .to_string(),
-            ]
-        }
-    };
+    info!("Querying Gamma API active markets");
+    let mut symbols = gamma_client
+        .fetch_all_symbols()
+        .await
+        .context("Failed to fetch symbols from Gamma API")?;
+    if symbols.is_empty() {
+        warn!("Zero symbols discovered from Gamma API");
+        anyhow::bail!("Gamma API returned 0 tokens");
+    }
+    info!(
+        "Discovered {} symbols from Gamma API. Sample: {:?}",
+        symbols.len(),
+        symbols.iter().take(5).collect::<Vec<_>>()
+    );
 
-    // 3. Spawn SbeBoundedWriter background thread
+    symbols.shuffle(&mut rand::rng());
+    info!("Shuffled symbols across sockets");
+
+    let min_pairs = std::env::var("MIN_ACTIVE_PAIRS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MIN_ACTIVE_PAIRS);
+    let max_pairs = std::env::var("MAX_ACTIVE_PAIRS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_ACTIVE_PAIRS);
+    let max_symbols_per_socket = std::env::var("MAX_SYMBOLS_PER_SOCKET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_SYMBOLS_PER_SOCKET);
+
+    // Calculate required socket pairs dynamically based on discovered symbol count and per-socket ceiling
+    let calculated_pairs = (symbols.len().div_ceil(max_symbols_per_socket))
+        .max(min_pairs)
+        .min(max_pairs);
+    info!(
+        "Topology: {} active pairs (bounds: [{min_pairs}, {max_pairs}], max {max_symbols_per_socket} symbols/socket)",
+        calculated_pairs
+    );
+
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
-    info!("Spawning SbeBoundedWriter OS thread in directory {data_dir:?}...");
+    info!("Spawning SbeBoundedWriter thread in directory {data_dir:?}");
     let (writer_tx, writer_rx) = crossbeam::channel::bounded(BOUNDED_CHANNEL_CAPACITY);
     let writer_handle = SbeBoundedWriter::spawn(&data_dir, writer_rx)
         .context("Failed to spawn SbeBoundedWriter background thread")?;
 
-    // 4. Initialize WsManager: connect active socket pool and seed symbols equally
-    info!("Initializing WsManager and connecting {NUM_ACTIVE_SOCKETS} active sockets...");
-    let mut ws_manager = WsManager::new(writer_tx);
+    info!("Initializing WsManager with {calculated_pairs} pairs");
+    let subscription_manager = SubscriptionManager::new(std::time::Duration::from_secs(15), 5, 1);
+    let mut ws_manager = WsManager::new(writer_tx, subscription_manager);
 
-    let active_count = NUM_ACTIVE_SOCKETS.max(1);
+    let active_count = calculated_pairs;
     let mut socket_symbols: Vec<Vec<String>> = vec![Vec::new(); active_count];
     for (i, sym) in symbols.iter().enumerate() {
-        let target_sock = i % active_count;
-        socket_symbols[target_sock].push(sym.clone());
+        let target_pair = i % active_count;
+        socket_symbols[target_pair].push(sym.clone());
+        // Primary sockets occupy even indices: 2 * target_pair
         ws_manager
             .symbol_states
-            .insert(sym.clone(), SymbolState::new(sym.clone(), target_sock));
+            .insert(sym.clone(), SymbolState::new(sym.clone(), 2 * target_pair));
     }
 
-    for (idx, assigned) in socket_symbols.iter().enumerate().take(active_count) {
-        let status = if idx == 0 {
+    for (pair_id, assigned) in socket_symbols.iter().enumerate().take(active_count) {
+        let status = if pair_id == 0 {
             WsStatus::Master
         } else {
             WsStatus::Healthy
         };
 
-        match Ws::connect(&polymarket_ws_url, status).await {
-            Ok(mut ws) => {
+        // Primary socket
+        match Ws::connect(&polymarket_ws_url, status, WsRole::Primary, pair_id).await {
+            Ok(mut primary_ws) => {
                 if !assigned.is_empty() {
-                    if let Err(e) = ws.subscribe(assigned).await {
-                        warn!("Socket #{idx} failed to subscribe to initial symbols: {e}");
+                    if let Err(e) = primary_ws.subscribe(assigned).await {
+                        warn!("Pair #{pair_id} Primary subscribe error: {e}");
                     } else {
-                        info!("Socket #{idx} ({status:?}) subscribed to {} symbols", assigned.len());
+                        info!(
+                            "Pair #{pair_id} Primary ({status:?}) subscribed: {} symbols",
+                            assigned.len()
+                        );
                     }
                 }
-                ws_manager.pool.push(ws);
+                ws_manager.pool.push(primary_ws);
             }
             Err(e) => {
-                warn!("Failed to connect initial active socket #{idx}: {e}");
+                warn!("Pair #{pair_id} Primary connect error: {e}");
+            }
+        }
+
+        match Ws::connect(
+            &polymarket_ws_url,
+            WsStatus::Healthy,
+            WsRole::Replica,
+            pair_id,
+        )
+        .await
+        {
+            Ok(mut replica_ws) => {
+                if !assigned.is_empty() {
+                    if let Err(e) = replica_ws.subscribe(assigned).await {
+                        warn!("Pair #{pair_id} Replica subscribe error: {e}");
+                    } else {
+                        info!(
+                            "Pair #{pair_id} Replica subscribed: {} symbols",
+                            assigned.len()
+                        );
+                    }
+                }
+                ws_manager.pool.push(replica_ws);
+            }
+            Err(e) => {
+                warn!("Pair #{pair_id} Replica connect error: {e}");
             }
         }
     }
 
-    // 5. Pre-warm standby sockets in standby_pool
-    info!("Pre-warming {NUM_STANDBY_SOCKETS} standby sockets in standby_pool...");
-    for idx in 0..NUM_STANDBY_SOCKETS {
-        match Ws::connect(&polymarket_ws_url, WsStatus::Healthy).await {
+    info!("Pre-warming {MIN_STANDBY_CAPACITY} standby sockets");
+    for idx in 0..MIN_STANDBY_CAPACITY {
+        match Ws::connect(
+            &polymarket_ws_url,
+            WsStatus::Healthy,
+            WsRole::Replica,
+            usize::MAX,
+        )
+        .await
+        {
             Ok(ws) => {
-                info!("Standby socket #{idx} pre-warmed successfully");
+                info!("Standby #{idx} pre-warmed");
                 ws_manager.standby_pool.push_back(ws);
             }
             Err(e) => {
-                warn!("Failed to pre-warm standby socket #{idx}: {e}");
+                warn!("Standby #{idx} pre-warm error: {e}");
             }
         }
     }
 
-    // 6. Run event loop: poll sockets, maintain delta_rate_sum, route discovery events on Master
-    // 7. Execute periodic 60-second full orderbook snapshots
-    // 8. Intercept SIGINT (Ctrl+C): invoke flush_all(), snapshot resting books, and close file handles cleanly
-    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-    // First tick fires immediately, consume it
+    let ping_secs = std::env::var("PING_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let snapshot_secs = std::env::var("SNAPSHOT_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(ping_secs));
     ping_interval.tick().await;
 
-    let mut snapshot_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut snapshot_interval =
+        tokio::time::interval(std::time::Duration::from_secs(snapshot_secs));
     snapshot_interval.tick().await;
 
-    let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(250));
-    flush_interval.tick().await;
+    let mut subscription_check_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    subscription_check_interval.tick().await;
 
-    info!("Engine running. Polling active sockets...");
+    let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    stats_interval.tick().await;
+
+    info!("Engine running. Polling sockets");
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT (Ctrl+C). Initiating graceful shutdown...");
+                info!("SIGINT received. Initiating graceful shutdown");
                 break;
+            }
+            _ = stats_interval.tick() => {
+                let total_deltas = ws_manager.total_deltas_received();
+                let symbols_count = ws_manager.symbol_states.len();
+                let active_pairs = ws_manager.pool.len() / 2;
+                info!(
+                    target: "feedback",
+                    "Symbols: {symbols_count} | Active Pairs: {active_pairs} | Total Deltas: {total_deltas}"
+                );
             }
             _ = ping_interval.tick() => {
                 ws_manager.send_pings().await;
+                for idx in 0..ws_manager.pool.len() {
+                    if ws_manager.pool[idx].status == WsStatus::Unhealthy {
+                        warn!("Ws died: socket #{idx}. Triggering hot swap");
+                        ws_manager.handle_socket_disconnect(idx, &polymarket_ws_url).await;
+                    }
+                }
+                ws_manager.prune_and_ping_standby(&polymarket_ws_url).await;
+            }
+            _ = subscription_check_interval.tick() => {
+                ws_manager.check_and_process_subscriptions().await;
             }
             _ = snapshot_interval.tick() => {
-                info!("Executing periodic 60-second full orderbook snapshots...");
+                info!("Executing 60s orderbook snapshots");
                 ws_manager.snapshot_resting_books();
-                ws_manager.flush_all();
             }
-            _ = flush_interval.tick() => {
-                ws_manager.flush_all();
-            }
-            res = ws_manager.poll_next_message() => {
+            res = ws_manager.poll_next_message(&polymarket_ws_url) => {
                 if let Err(e) = res {
-                    warn!("Error during message poll: {e}");
+                    warn!("Poll error: {e}");
                 }
             }
         }
     }
 
     // Graceful teardown
-    info!("Shutdown sequence: snapshotting resting books...");
-    ws_manager.snapshot_resting_books();
-    info!("Shutdown sequence: flushing all batch buffers...");
-    ws_manager.flush_all();
-    info!("Shutdown sequence: closing all active and standby websockets cleanly...");
+    info!("Closing websockets");
     ws_manager.close_all().await;
+    info!("Flushing batch buffers");
+    ws_manager.flush_all();
+    info!("Snapshotting resting books");
+    ws_manager.snapshot_resting_books();
     drop(ws_manager);
 
-    info!("Waiting for SbeBoundedWriter to flush and sync 64 MiB direct-IO chunks...");
+    info!("Flushing SbeBoundedWriter direct-IO chunks");
     writer_handle.join()?;
-    info!("Ingestion engine closed cleanly.");
 
+    info!("Engine shutdown completed");
     Ok(())
 }

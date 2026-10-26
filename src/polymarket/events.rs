@@ -6,7 +6,8 @@ use super::dtos::{
 use super::types::{MarketEventType, PONG};
 use serde::{Deserialize, Serialize};
 
-/// Every JSON message from the Polymarket public market WebSocket, tagged by `event_type`.
+/// Tagged union of all JSON frame types emitted by the Polymarket public market WebSocket channel,
+/// discriminated by the `event_type` field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum MarketEvent {
@@ -20,7 +21,7 @@ pub enum MarketEvent {
 }
 
 impl MarketEvent {
-    /// Returns the discriminator event type.
+    /// Returns the `MarketEventType` variant that identifies the category of this event.
     pub const fn event_type(&self) -> MarketEventType {
         match self {
             Self::Book(_) => MarketEventType::Book,
@@ -33,7 +34,7 @@ impl MarketEvent {
         }
     }
 
-    /// Returns the primary asset/token ID if applicable.
+    /// Extracts and returns the primary asset token ID from this event when one is present.
     pub fn asset_id(&self) -> Option<&str> {
         match self {
             Self::Book(b) => Some(&b.asset_id),
@@ -46,7 +47,7 @@ impl MarketEvent {
         }
     }
 
-    /// Returns the market condition ID if applicable.
+    /// Extracts and returns the market condition ID from this event when one is present.
     pub fn market_id(&self) -> Option<&str> {
         match self {
             Self::Book(b) => Some(&b.market),
@@ -59,7 +60,7 @@ impl MarketEvent {
         }
     }
 
-    /// Returns the exchange timestamp string.
+    /// Returns the exchange timestamp string carried by this event.
     pub fn timestamp(&self) -> &str {
         match self {
             Self::Book(b) => &b.timestamp,
@@ -73,10 +74,15 @@ impl MarketEvent {
     }
 }
 
-/// Parses a raw text frame from the Polymarket WebSocket into a list of `MarketEvent`s.
+/// Deserialises a raw text frame from the Polymarket WebSocket into a `Vec<MarketEvent>`,
+/// handling both single-object and JSON-array envelopes, and returning an empty list for
+/// non-JSON control frames (e.g. heartbeat PONG or plain-text status replies).
 pub fn parse_frame(text: &str) -> Result<Vec<MarketEvent>, serde_json::Error> {
     let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case(PONG) {
+    if trimmed.eq_ignore_ascii_case(PONG)
+        || trimmed.eq_ignore_ascii_case("NO NEW ASSETS")
+        || trimmed.eq_ignore_ascii_case("OK")
+    {
         return Ok(Vec::new());
     }
     if trimmed.starts_with('[') {

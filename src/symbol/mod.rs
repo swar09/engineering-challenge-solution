@@ -1,5 +1,5 @@
-use std::time::Instant;
 use chrono::{DateTime, Utc};
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct SymbolState {
@@ -21,4 +21,3 @@ impl SymbolState {
         }
     }
 }
-

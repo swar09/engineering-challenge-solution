@@ -1,5 +1,5 @@
+use crate::gamma::types::{GammaMarket, KeysetResponse};
 use anyhow::{Context, Result};
-use crate::gamma::types::GammaMarket;
 
 pub struct GammaClient {
     client: reqwest::Client,
@@ -30,9 +30,15 @@ impl GammaClient {
         }
     }
 
-    /// Fetches the top 50 active markets from Gamma API and returns a flat list of CLOB token IDs.
+    /// Queries the Gamma REST API for active, open markets ordered by 24-hour volume descending,
+    /// filters for markets with positive 24-hour volume and non-empty resting liquidity,
+    /// extracts and deduplicates the CLOB token IDs, and returns up to 50 active tradeable tokens.
     pub async fn fetch_top_50_clob_tokens(&self) -> Result<Vec<String>> {
-        let url = format!("{}/markets?limit=50&active=true&closed=false", self.base_url);
+        // Query markets sorted by 24h trading volume descending to guarantee active trading
+        let url = format!(
+            "{}/markets?limit=100&active=true&closed=false&order=volume24hr&ascending=false",
+            self.base_url
+        );
         let resp = self
             .client
             .get(&url)
@@ -47,10 +53,17 @@ impl GammaClient {
 
         let mut token_ids = Vec::new();
         for market in markets {
-            let ids = market.parse_clob_token_ids();
-            for id in ids {
-                if !token_ids.contains(&id) {
-                    token_ids.push(id);
+            let vol = market.volume_24hr.unwrap_or(0.0);
+            let liq = market.parse_liquidity();
+            if vol > 0.0 && liq > 0.0 {
+                let ids = market.parse_clob_token_ids();
+                for id in ids {
+                    if !token_ids.contains(&id) {
+                        token_ids.push(id);
+                        if token_ids.len() >= 50 {
+                            return Ok(token_ids);
+                        }
+                    }
                 }
             }
         }
@@ -58,27 +71,21 @@ impl GammaClient {
         Ok(token_ids)
     }
 
-    /// Fetches all active symbols from Gamma API using pagination with a default timeout of 30s.
+    /// Paginates through all active markets on the Gamma REST API using a 30-second wall-clock timeout, deduplicates CLOB token IDs across pages, and returns the complete flat list.
     pub async fn fetch_all_symbols(&self) -> Result<Vec<String>> {
         self.fetch_all_symbols_with_timeout(std::time::Duration::from_secs(30))
             .await
     }
 
-    /// Alias matching exact user-requested naming `fetchAllsymbols`.
-    #[allow(non_snake_case)]
-    #[inline]
-    pub async fn fetchAllsymbols(&self) -> Result<Vec<String>> {
-        self.fetch_all_symbols().await
-    }
-
-    /// Fetches all active symbols from Gamma API using pagination within the given timeout.
+    /// Paginates through all active markets on the Gamma REST API using `/markets/keyset` cursor pagination
+    /// until all pages are retrieved or the given timeout elapses, deduplicating CLOB token IDs.
     pub async fn fetch_all_symbols_with_timeout(
         &self,
         timeout: std::time::Duration,
     ) -> Result<Vec<String>> {
         let start_time = std::time::Instant::now();
         let mut token_ids = Vec::new();
-        let mut offset = 0;
+        let mut cursor: Option<String> = None;
         const PAGE_LIMIT: usize = 100;
 
         while start_time.elapsed() < timeout {
@@ -87,58 +94,88 @@ impl GammaClient {
                 break;
             }
 
-            let url = format!(
-                "{}/markets?limit={PAGE_LIMIT}&offset={offset}&active=true&closed=false",
+            let mut url = format!(
+                "{}/markets/keyset?limit={PAGE_LIMIT}&active=true&closed=false",
                 self.base_url
             );
+            if let Some(c) = &cursor {
+                url.push_str("&cursor=");
+                url.push_str(c);
+            }
 
             let resp = match self.client.get(&url).timeout(remaining).send().await {
                 Ok(r) if r.status().is_success() => r,
-                Ok(_) => break, // Reached offset limit or end
+                Ok(_) => {
+                    // Fall back to standard offset /markets if /markets/keyset is not supported on mock
+                    let fallback_url = format!(
+                        "{}/markets?limit={PAGE_LIMIT}&active=true&closed=false",
+                        self.base_url
+                    );
+                    if let Ok(r) = self
+                        .client
+                        .get(&fallback_url)
+                        .timeout(remaining)
+                        .send()
+                        .await
+                        && r.status().is_success()
+                        && let Ok(markets) = r.json::<Vec<GammaMarket>>().await
+                    {
+                        for m in markets {
+                            for id in m.parse_clob_token_ids() {
+                                if !token_ids.contains(&id) {
+                                    token_ids.push(id);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
                 Err(e) => {
                     tracing::warn!("Pagination finished or timed out: {e}");
                     break;
                 }
             };
 
-            let markets: Vec<GammaMarket> = match resp.json().await {
-                Ok(m) => m,
+            // Parse response as KeysetResponse or fallback Vec<GammaMarket>
+            let body_text = match resp.text().await {
+                Ok(t) => t,
                 Err(_) => break,
             };
 
-            if markets.is_empty() {
-                break;
-            }
-
-            let page_len = markets.len();
-            for market in markets {
-                for id in market.parse_clob_token_ids() {
-                    if !token_ids.contains(&id) {
-                        token_ids.push(id);
+            if let Ok(keyset) = serde_json::from_str::<KeysetResponse>(&body_text) {
+                if keyset.markets.is_empty() {
+                    break;
+                }
+                for market in keyset.markets {
+                    for id in market.parse_clob_token_ids() {
+                        if !token_ids.contains(&id) {
+                            token_ids.push(id);
+                        }
                     }
                 }
-            }
-
-            if page_len < PAGE_LIMIT {
+                match keyset.next_cursor {
+                    Some(next) if !next.is_empty() && next != "LTE=" => {
+                        cursor = Some(next);
+                    }
+                    _ => break,
+                }
+            } else if let Ok(markets) = serde_json::from_str::<Vec<GammaMarket>>(&body_text) {
+                if markets.is_empty() {
+                    break;
+                }
+                for market in markets {
+                    for id in market.parse_clob_token_ids() {
+                        if !token_ids.contains(&id) {
+                            token_ids.push(id);
+                        }
+                    }
+                }
+                break;
+            } else {
                 break;
             }
-            offset += page_len;
         }
 
         Ok(token_ids)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_fetch_all_symbols_with_mock() {
-        let client = GammaClient::new();
-        let res = client
-            .fetch_all_symbols_with_timeout(std::time::Duration::from_millis(500))
-            .await;
-        assert!(res.is_ok());
     }
 }

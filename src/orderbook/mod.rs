@@ -1,14 +1,17 @@
-use std::collections::BTreeMap;
-use chrono::{DateTime, Utc};
 use crate::Side;
+use crate::util::dtos::SbeEncode;
 use crate::util::dtos::challenge_orderbook::{
     PriceLevelUpdateDomain, SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain,
 };
-use crate::util::dtos::SbeEncode;
+use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 pub type Price = i64;
 pub type Quantity = i64;
 
+/// Multiplier for converting floating-point prices and quantities into integer fixed-point representation (1_000_000 units = 1 USDC or 1 share).
+pub const DEFAULT_SCALE: i64 = 1_000_000;
 pub const FIXED_POINT_SCALE: f64 = 1_000_000.0;
 
 #[inline]
@@ -51,6 +54,7 @@ pub struct OrderBook {
     pub bids: BTreeMap<Price, Quantity>,
     pub asks: BTreeMap<Price, Quantity>,
     pub last_exchange_timestamp: Option<DateTime<Utc>>,
+    pub last_delta_received_at: Option<Instant>,
 }
 
 impl OrderBook {
@@ -60,10 +64,12 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             last_exchange_timestamp: None,
+            last_delta_received_at: None,
         }
     }
 
-    /// Clears resting book and applies a full snapshot of bids and asks.
+    /// Clears the existing bids and asks, populates the B-Tree with the supplied price levels,
+    /// records the exchange timestamp, and returns a `SnapshotDomain` reflecting the new book state.
     pub fn apply_snapshot(
         &mut self,
         bids: Vec<(Price, Quantity)>,
@@ -89,7 +95,9 @@ impl OrderBook {
         self.to_snapshot_domain(received_at, exchange_timestamp)
     }
 
-    /// Applies an incremental L2 delta update. If quantity is 0, the price level is removed.
+    /// Applies a single price level delta to the resting B-Tree: inserts the price
+    /// level when quantity is positive, removes it when quantity is zero or negative,
+    /// records the exchange timestamp, and returns a `PriceLevelUpdateDomain` describing the change.
     pub fn apply_delta(
         &mut self,
         side: Side,
@@ -115,6 +123,7 @@ impl OrderBook {
             }
         }
         self.last_exchange_timestamp = Some(exchange_timestamp);
+        self.last_delta_received_at = Some(Instant::now());
 
         PriceLevelUpdateDomain {
             backtest_timestamp,
@@ -126,7 +135,8 @@ impl OrderBook {
         }
     }
 
-    /// Produces a SnapshotDomain representing the current book state.
+    /// Serialises the current resting B-Tree into a `SnapshotDomain`, ordering bids descending by
+    /// price and asks ascending by price, and stamping both the received-at and exchange timestamps.
     pub fn to_snapshot_domain(
         &self,
         received_at: DateTime<Utc>,

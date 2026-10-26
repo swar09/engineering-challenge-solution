@@ -1,9 +1,9 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::thread::{self, JoinHandle};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use crossbeam::channel::Receiver;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::thread::{self, JoinHandle};
 use tracing::{info, warn};
 
 use crate::orderbook::OrderbookMessage;
@@ -78,10 +78,7 @@ impl SbeBoundedWriter {
                 writer
                     .flush()
                     .context("Failed to flush AlignedSbeWriter on shutdown")?;
-                info!(
-                    "SBE writer finished successfully on {:?}",
-                    thread_file_path
-                );
+                info!("SBE writer finished successfully on {:?}", thread_file_path);
                 Ok(())
             })
             .context("Failed to spawn writer thread")?;
@@ -96,12 +93,12 @@ impl SbeBoundedWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Side;
     use crate::util::dtos::challenge_orderbook::{
         AnyMessage, PriceLevelUpdateDomain, SnapshotAsksEntryDomain, SnapshotBidsEntryDomain,
         SnapshotDomain,
     };
     use crate::util::{AlignedSbeReader, OrderbookSchema};
-    use crate::Side;
     use chrono::DateTime;
 
     #[test]

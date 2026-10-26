@@ -1,5 +1,6 @@
 pub mod gamma;
 pub mod orderbook;
+pub mod polymarket;
 pub mod symbol;
 pub mod util;
 pub mod websocket;

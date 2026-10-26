@@ -2,10 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Fixed string constant for the Polymarket WebSocket heartbeat reply.
+/// Literal string constant sent by the exchange as a heartbeat reply to a `PING` frame.
 pub const PONG: &str = "PONG";
 
-/// Order book side on the wire.
+/// Bid or ask side of an order, serialised in uppercase on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Side {
@@ -14,7 +14,7 @@ pub enum Side {
 }
 
 impl Side {
-    /// Returns the opposite side of the book.
+    /// Swaps Buy for Sell and Sell for Buy, returning the complementary book side.
     #[inline]
     pub const fn opposite(self) -> Self {
         match self {
@@ -24,7 +24,7 @@ impl Side {
     }
 }
 
-/// WebSocket channel type requested during initial subscription.
+/// Channel category used in the subscription frame to select the market data feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelType {
@@ -32,7 +32,7 @@ pub enum ChannelType {
     User,
 }
 
-/// Dynamic subscription mutation operation on an open connection.
+/// Operation applied to symbol subscriptions on an already-connected WebSocket without requiring reconnection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Operation {
@@ -40,7 +40,7 @@ pub enum Operation {
     Unsubscribe,
 }
 
-/// Discriminator for all incoming Polymarket WebSocket market channel frames.
+/// Tag enum mapping each `event_type` string value to its corresponding `MarketEvent` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MarketEventType {

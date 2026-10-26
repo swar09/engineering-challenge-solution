@@ -55,6 +55,9 @@ fn test_verify_data_sbe_files() -> anyhow::Result<()> {
         }
     }
 
-    assert!(found_file, "At least one valid SBE file must exist in data/");
+    assert!(
+        found_file,
+        "At least one valid SBE file must exist in data/"
+    );
     Ok(())
 }
